@@ -7,13 +7,12 @@ using System.CommandLine.Parsing;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Pipes;
 using System.Linq;
 using System.Reflection;
-using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using System.ServiceProcess;
-using System.Text;
 using System.Threading;
 using log4net;
 using log4net.Appender;
@@ -33,6 +32,8 @@ namespace WinSW
     // NOTE: Keep description strings in sync with docs.
     public static class Program
     {
+        private const string NoPipe = "-";
+
         private static readonly ILog Log = LogManager.GetLogger(typeof(Program));
 
         internal static Action<Exception, InvocationContext>? TestExceptionHandler;
@@ -48,7 +49,7 @@ namespace WinSW
                     return TestExecutablePath;
                 }
 
-                using Process current = Process.GetCurrentProcess();
+                using var current = Process.GetCurrentProcess();
                 return current.MainModule!.FileName!;
             }
         }
@@ -63,13 +64,37 @@ namespace WinSW
                 _ = ConsoleApis.FreeConsole();
                 _ = ConsoleApis.AttachConsole(ConsoleApis.ATTACH_PARENT_PROCESS);
 
-#if NETCOREAPP
-                args = args[1..];
+                string stdinName = args[1];
+                if (stdinName != NoPipe)
+                {
+                    var stdin = new NamedPipeClientStream(".", stdinName, PipeDirection.In, PipeOptions.Asynchronous);
+                    stdin.Connect();
+                    Console.SetIn(new StreamReader(stdin));
+                }
+
+                string stdoutName = args[2];
+                if (stdoutName != NoPipe)
+                {
+                    var stdout = new NamedPipeClientStream(".", stdoutName, PipeDirection.Out, PipeOptions.Asynchronous);
+                    stdout.Connect();
+                    Console.SetOut(new StreamWriter(stdout) { AutoFlush = true });
+                }
+
+                string stderrName = args[3];
+                if (stderrName != NoPipe)
+                {
+                    var stderr = new NamedPipeClientStream(".", stderrName, PipeDirection.Out, PipeOptions.Asynchronous);
+                    stderr.Connect();
+                    Console.SetError(new StreamWriter(stderr) { AutoFlush = true });
+                }
+
+#if NET
+                args = args[4..];
 #else
                 string[] oldArgs = args;
-                int newLength = oldArgs.Length - 1;
+                int newLength = oldArgs.Length - 4;
                 args = new string[newLength];
-                Array.Copy(oldArgs, 1, args, 0, newLength);
+                Array.Copy(oldArgs, 4, args, 0, newLength);
 #endif
             }
             else if (Environment.OSVersion.Version.Major == 5)
@@ -89,14 +114,12 @@ namespace WinSW
                     XmlServiceConfig config = null!;
                     try
                     {
-                        config = LoadConfig(pathToConfig);
+                        config = LoadConfigAndInitLoggers(pathToConfig, false);
                     }
                     catch (FileNotFoundException)
                     {
                         Throw.Command.Exception("The specified command or file was not found.");
                     }
-
-                    InitLoggers(config, enableConsoleLogging: false);
 
                     Log.Debug("Starting WinSW in service mode.");
 
@@ -114,9 +137,9 @@ namespace WinSW
                 }),
             };
 
-            using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
+            using (var identity = WindowsIdentity.GetCurrent())
             {
-                WindowsPrincipal principal = new WindowsPrincipal(identity);
+                var principal = new WindowsPrincipal(identity);
                 if (principal.IsInRole(new SecurityIdentifier(WellKnownSidType.ServiceSid, null)) ||
                     principal.IsInRole(new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null)) ||
                     principal.IsInRole(new SecurityIdentifier(WellKnownSidType.LocalServiceSid, null)) ||
@@ -226,20 +249,6 @@ namespace WinSW
             }
 
             {
-                var test = new Command("test", "Checks if the service can be started and then stopped without installation.")
-                {
-                    Handler = CommandHandler.Create<string?, bool, bool>(Test),
-                };
-
-                test.Add(config);
-                test.Add(noElevate);
-
-                test.Add(new Option("--no-break", "Ignores keystrokes."));
-
-                root.Add(test);
-            }
-
-            {
                 var refresh = new Command("refresh", "Refreshes the service properties without reinstallation.")
                 {
                     Handler = CommandHandler.Create<string?, bool>(Refresh),
@@ -252,7 +261,7 @@ namespace WinSW
             }
 
             {
-                var customize = new Command("customize")
+                var customize = new Command("customize", "Customizes the wrapper executable.")
                 {
                     Handler = CommandHandler.Create<string, string>(Customize),
                 };
@@ -292,10 +301,12 @@ namespace WinSW
                 {
                     var ps = new Command("ps", "Draws the process tree associated with the service.")
                     {
-                        Handler = CommandHandler.Create<string?>(DevPs),
+                        Handler = CommandHandler.Create<string?, bool>(DevPs),
                     };
 
                     ps.Add(config);
+
+                    ps.Add(new Option(new[] { "--all", "-a" }));
 
                     dev.Add(ps);
                 }
@@ -391,8 +402,7 @@ namespace WinSW
 
             void Install(string? pathToConfig, bool noElevate, string? username, string? password)
             {
-                XmlServiceConfig config = LoadConfig(pathToConfig);
-                InitLoggers(config, enableConsoleLogging: true);
+                var config = LoadConfigAndInitLoggers(pathToConfig, true);
 
                 if (!elevated)
                 {
@@ -402,7 +412,7 @@ namespace WinSW
 
                 Log.Info($"Installing service '{config.Format()}'...");
 
-                using ServiceManager scm = ServiceManager.Open(ServiceManagerAccess.CreateService);
+                using var scm = ServiceManager.Open(ServiceManagerAccess.CreateService);
 
                 if (scm.ServiceExists(config.Name))
                 {
@@ -410,36 +420,42 @@ namespace WinSW
                     Throw.Command.Win32Exception(Errors.ERROR_SERVICE_EXISTS, "Failed to install the service.");
                 }
 
+                bool saveCredential = false;
                 if (config.HasServiceAccount())
                 {
                     username = config.ServiceAccountUserName ?? username;
                     password = config.ServiceAccountPassword ?? password;
 
-                    if (username is null || password is null && !IsSpecialAccount(username))
+                    if (username is null || password is null && !Security.IsSpecialAccount(username))
                     {
                         switch (config.ServiceAccountPrompt)
                         {
                             case "dialog":
-                                Credentials.PropmtForCredentialsDialog(
-                                    ref username,
-                                    ref password,
-                                    "Windows Service Wrapper",
-                                    "Enter the service account credentials");
+                                if (!Credentials.Load($"WinSW:{config.Name}", out username, out password))
+                                {
+                                    Credentials.PromptForCredentialsDialog(
+                                        ref username,
+                                        ref password,
+                                        "Windows Service Wrapper",
+                                        "Enter the service account credentials",
+                                        ref saveCredential);
+                                }
+
                                 break;
 
                             case "console":
-                                PromptForCredentialsConsole();
+                                Credentials.PromptForCredentialsConsole(ref username, ref password);
                                 break;
                         }
                     }
                 }
 
-                if (username != null && !IsSpecialAccount(username))
+                if (username != null && !Security.IsSpecialAccount(username))
                 {
                     Security.AddServiceLogonRight(ref username);
                 }
 
-                using Service sc = scm.CreateService(
+                using var sc = scm.CreateService(
                     config.Name,
                     config.DisplayName,
                     config.StartMode,
@@ -448,13 +464,18 @@ namespace WinSW
                     username,
                     password);
 
+                if (saveCredential)
+                {
+                    Credentials.Save($"WinSW:{config.Name}", username, password);
+                }
+
                 string description = config.Description;
                 if (description.Length != 0)
                 {
                     sc.SetDescription(description);
                 }
 
-                SC_ACTION[] actions = config.FailureActions;
+                var actions = config.FailureActions;
                 if (actions.Length > 0)
                 {
                     sc.SetFailureActions(config.ResetFailureAfter, actions);
@@ -485,39 +506,11 @@ namespace WinSW
                 }
 
                 Log.Info($"Service '{config.Format()}' was installed successfully.");
-
-                void PromptForCredentialsConsole()
-                {
-                    if (username is null)
-                    {
-                        Console.Write("Username: ");
-                        username = Console.ReadLine()!;
-                    }
-
-                    if (password is null && !IsSpecialAccount(username))
-                    {
-                        Console.Write("Password: ");
-                        password = ReadPassword();
-                    }
-
-                    Console.WriteLine();
-                }
-
-                static bool IsSpecialAccount(string accountName) => accountName switch
-                {
-                    @"LocalSystem" => true,
-                    @".\LocalSystem" => true,
-                    @"NT AUTHORITY\LocalService" => true,
-                    @"NT AUTHORITY\NetworkService" => true,
-                    string name when name == $@"{Environment.MachineName}\LocalSystem" => true,
-                    _ => false
-                };
             }
 
             void Uninstall(string? pathToConfig, bool noElevate)
             {
-                XmlServiceConfig config = LoadConfig(pathToConfig);
-                InitLoggers(config, enableConsoleLogging: true);
+                var config = LoadConfigAndInitLoggers(pathToConfig, true);
 
                 if (!elevated)
                 {
@@ -527,10 +520,10 @@ namespace WinSW
 
                 Log.Info($"Uninstalling service '{config.Format()}'...");
 
-                using ServiceManager scm = ServiceManager.Open(ServiceManagerAccess.Connect);
+                using var scm = ServiceManager.Open(ServiceManagerAccess.Connect);
                 try
                 {
-                    using Service sc = scm.OpenService(config.Name);
+                    using var sc = scm.OpenService(config.Name);
 
                     if (sc.Status != ServiceControllerStatus.Stopped)
                     {
@@ -566,8 +559,7 @@ namespace WinSW
 
             void Start(string? pathToConfig, bool noElevate, bool noWait, CancellationToken ct)
             {
-                XmlServiceConfig config = LoadConfig(pathToConfig);
-                InitLoggers(config, enableConsoleLogging: true);
+                var config = LoadConfigAndInitLoggers(pathToConfig, true);
 
                 if (!elevated)
                 {
@@ -612,8 +604,7 @@ namespace WinSW
 
             void Stop(string? pathToConfig, bool noElevate, bool noWait, bool force, CancellationToken ct)
             {
-                XmlServiceConfig config = LoadConfig(pathToConfig);
-                InitLoggers(config, enableConsoleLogging: true);
+                var config = LoadConfigAndInitLoggers(pathToConfig, true);
 
                 if (!elevated)
                 {
@@ -666,8 +657,7 @@ namespace WinSW
 
             void Restart(string? pathToConfig, bool noElevate, bool force, CancellationToken ct)
             {
-                XmlServiceConfig config = LoadConfig(pathToConfig);
-                InitLoggers(config, enableConsoleLogging: true);
+                var config = LoadConfigAndInitLoggers(pathToConfig, true);
 
                 if (!elevated)
                 {
@@ -729,7 +719,7 @@ namespace WinSW
 
                 if (startedDependentServices != null)
                 {
-                    foreach (ServiceController service in startedDependentServices)
+                    foreach (var service in startedDependentServices)
                     {
                         if (service.Status == ServiceControllerStatus.Stopped)
                         {
@@ -744,8 +734,7 @@ namespace WinSW
 
             void RestartSelf(string? pathToConfig)
             {
-                XmlServiceConfig config = LoadConfig(pathToConfig);
-                InitLoggers(config, enableConsoleLogging: true);
+                var config = LoadConfigAndInitLoggers(pathToConfig, true);
 
                 if (!elevated)
                 {
@@ -765,29 +754,31 @@ namespace WinSW
                     IntPtr.Zero,
                     null,
                     default,
-                    out _))
+                    out var processInfo))
                 {
                     Throw.Command.Win32Exception("Failed to invoke restart.");
                 }
+
+                _ = HandleApis.CloseHandle(processInfo.ProcessHandle);
+                _ = HandleApis.CloseHandle(processInfo.ThreadHandle);
             }
 
             static int Status(string? pathToConfig)
             {
-                XmlServiceConfig config = LoadConfig(pathToConfig);
-                InitLoggers(config, enableConsoleLogging: true);
+                var config = LoadConfigAndInitLoggers(pathToConfig, true);
 
                 using var svc = new ServiceController(config.Name);
                 try
                 {
                     Console.WriteLine(svc.Status switch
                     {
-                        ServiceControllerStatus.StartPending => "Starting",
-                        ServiceControllerStatus.StopPending => "Stopping",
-                        ServiceControllerStatus.Running => "Running",
-                        ServiceControllerStatus.ContinuePending => "Continuing",
-                        ServiceControllerStatus.PausePending => "Pausing",
-                        ServiceControllerStatus.Paused => "Paused",
-                        _ => "Stopped"
+                        ServiceControllerStatus.StartPending => "Active (starting)",
+                        ServiceControllerStatus.StopPending => "Active (stopping)",
+                        ServiceControllerStatus.Running => "Active (running)",
+                        ServiceControllerStatus.ContinuePending => "Active (continuing)",
+                        ServiceControllerStatus.PausePending => "Active (pausing)",
+                        ServiceControllerStatus.Paused => "Active (paused)",
+                        _ => "Inactive (stopped)"
                     });
 
                     return svc.Status switch
@@ -804,55 +795,9 @@ namespace WinSW
                 }
             }
 
-            void Test(string? pathToConfig, bool noElevate, bool noBreak)
-            {
-                XmlServiceConfig config = LoadConfig(pathToConfig);
-                InitLoggers(config, enableConsoleLogging: true);
-
-                if (!elevated)
-                {
-                    Elevate(noElevate);
-                    return;
-                }
-
-                AutoRefresh(config);
-
-                using WrapperService wsvc = new WrapperService(config);
-                wsvc.RaiseOnStart(args);
-                try
-                {
-                    if (!noBreak)
-                    {
-                        Console.WriteLine("Press any key to stop the service...");
-                        _ = Console.ReadKey();
-                    }
-                    else
-                    {
-                        using ManualResetEvent evt = new ManualResetEvent(false);
-
-                        Console.WriteLine("Press Ctrl+C to stop the service...");
-                        Console.CancelKeyPress += CancelKeyPress;
-
-                        _ = evt.WaitOne();
-                        Console.CancelKeyPress -= CancelKeyPress;
-
-                        void CancelKeyPress(object? sender, ConsoleCancelEventArgs e)
-                        {
-                            e.Cancel = true;
-                            evt.Set();
-                        }
-                    }
-                }
-                finally
-                {
-                    wsvc.RaiseOnStop();
-                }
-            }
-
             void Refresh(string? pathToConfig, bool noElevate)
             {
-                XmlServiceConfig config = LoadConfig(pathToConfig);
-                InitLoggers(config, enableConsoleLogging: true);
+                var config = LoadConfigAndInitLoggers(pathToConfig, true);
 
                 if (!elevated)
                 {
@@ -863,55 +808,87 @@ namespace WinSW
                 DoRefresh(config);
             }
 
-            static void DevPs(string? pathToConfig)
+            static unsafe void DevPs(string? pathToConfig, bool all)
             {
-                XmlServiceConfig config = LoadConfig(pathToConfig);
+                if (all)
+                {
+                    using var scm = ServiceManager.Open(ServiceManagerAccess.EnumerateService);
+                    int prevProcessId = -1;
+                    foreach (var status in scm.EnumerateServices())
+                    {
+                        using var sc = scm.OpenService(status->ServiceName, ServiceAccess.QueryConfig | ServiceAccess.QueryStatus);
+                        if (sc.ExecutablePath.StartsWith($"\"{ExecutablePath}\""))
+                        {
+                            int processId = sc.ProcessId;
+                            if (processId >= 0)
+                            {
+                                if (prevProcessId >= 0)
+                                {
+                                    using var process = Process.GetProcessById(prevProcessId);
+                                    Draw(process, string.Empty, false);
+                                }
+                            }
 
-                using ServiceManager scm = ServiceManager.Open(ServiceManagerAccess.Connect);
-                using Service sc = scm.OpenService(config.Name, ServiceAccess.QueryStatus);
+                            prevProcessId = processId;
+                        }
+                    }
 
-                int processId = sc.ProcessId;
-                if (processId >= 0)
+                    if (prevProcessId >= 0)
+                    {
+                        using var process = Process.GetProcessById(prevProcessId);
+                        Draw(process, string.Empty, true);
+                    }
+                }
+                else
+                {
+                    var config = LoadConfigAndInitLoggers(pathToConfig, true);
+
+                    using var scm = ServiceManager.Open(ServiceManagerAccess.Connect);
+                    using var sc = scm.OpenService(config.Name, ServiceAccess.QueryStatus);
+
+                    int processId = sc.ProcessId;
+                    if (processId >= 0)
+                    {
+                        using var process = Process.GetProcessById(processId);
+                        Draw(process, string.Empty, true);
+                    }
+                }
+
+                static void Draw(Process process, string indentation, bool isLastChild)
                 {
                     const string Vertical = " \u2502 ";
                     const string Corner = " \u2514\u2500";
                     const string Cross = " \u251c\u2500";
                     const string Space = "   ";
 
-                    using Process process = Process.GetProcessById(processId);
-                    Draw(process, string.Empty, true);
+                    Console.Write(indentation);
 
-                    static void Draw(Process process, string indentation, bool isLastChild)
+                    if (isLastChild)
                     {
-                        Console.Write(indentation);
+                        Console.Write(Corner);
+                        indentation += Space;
+                    }
+                    else
+                    {
+                        Console.Write(Cross);
+                        indentation += Vertical;
+                    }
 
-                        if (isLastChild)
-                        {
-                            Console.Write(Corner);
-                            indentation += Space;
-                        }
-                        else
-                        {
-                            Console.Write(Cross);
-                            indentation += Vertical;
-                        }
+                    Console.WriteLine(process.Format());
 
-                        Console.WriteLine(process.Format());
-
-                        List<Process> children = process.GetChildren();
-                        int count = children.Count;
-                        for (int i = 0; i < count; i++)
-                        {
-                            using Process child = children[i];
-                            Draw(child, indentation, i == count - 1);
-                        }
+                    var children = process.GetChildren();
+                    int count = children.Count;
+                    for (int i = 0; i < count; i++)
+                    {
+                        using var child = children[i];
+                        Draw(child, indentation, i == count - 1);
                     }
                 }
             }
 
             void DevKill(string? pathToConfig, bool noElevate)
             {
-                XmlServiceConfig config = LoadConfig(pathToConfig);
+                var config = LoadConfigAndInitLoggers(pathToConfig, true);
 
                 if (!elevated)
                 {
@@ -919,13 +896,13 @@ namespace WinSW
                     return;
                 }
 
-                using ServiceManager scm = ServiceManager.Open();
-                using Service sc = scm.OpenService(config.Name);
+                using var scm = ServiceManager.Open();
+                using var sc = scm.OpenService(config.Name);
 
                 int processId = sc.ProcessId;
                 if (processId >= 0)
                 {
-                    using Process process = Process.GetProcessById(processId);
+                    using var process = Process.GetProcessById(processId);
 
                     process.StopDescendants(config.StopTimeoutInMs);
                 }
@@ -934,22 +911,13 @@ namespace WinSW
             static unsafe void DevList()
             {
                 using var scm = ServiceManager.Open(ServiceManagerAccess.EnumerateService);
-                (IntPtr services, int count) = scm.EnumerateServices();
-                try
+                foreach (var status in scm.EnumerateServices())
                 {
-                    for (int i = 0; i < count; i++)
+                    using var sc = scm.OpenService(status->ServiceName, ServiceAccess.QueryConfig);
+                    if (sc.ExecutablePath.StartsWith($"\"{ExecutablePath}\""))
                     {
-                        var status = (ServiceApis.ENUM_SERVICE_STATUS*)services + i;
-                        using var sc = scm.OpenService(status->ServiceName, ServiceAccess.QueryConfig);
-                        if (sc.ExecutablePath.StartsWith($"\"{ExecutablePath}\""))
-                        {
-                            Console.WriteLine(status->ToString());
-                        }
+                        Console.WriteLine(status->ToString());
                     }
-                }
-                finally
-                {
-                    Marshal.FreeHGlobal(services);
                 }
             }
 
@@ -973,24 +941,48 @@ namespace WinSW
                     Throw.Command.Win32Exception(Errors.ERROR_ACCESS_DENIED);
                 }
 
-                using Process current = Process.GetCurrentProcess();
+                string? stdinName = Console.IsInputRedirected ? Guid.NewGuid().ToString() : null;
+                string? stdoutName = Console.IsOutputRedirected ? Guid.NewGuid().ToString() : null;
+                string? stderrName = Console.IsErrorRedirected ? Guid.NewGuid().ToString() : null;
 
                 string exe = Environment.GetCommandLineArgs()[0];
                 string commandLine = Environment.CommandLine;
-                string arguments = "--elevated" + commandLine.Remove(commandLine.IndexOf(exe), exe.Length).TrimStart('"');
+                string arguments = "--elevated" +
+                    " " + (stdinName ?? NoPipe) +
+                    " " + (stdoutName ?? NoPipe) +
+                    " " + (stderrName ?? NoPipe) +
+                    commandLine.Remove(commandLine.IndexOf(exe), exe.Length).TrimStart('"');
 
-                ProcessStartInfo startInfo = new ProcessStartInfo
+                var startInfo = new ProcessStartInfo
                 {
                     UseShellExecute = true,
                     Verb = "runas",
-                    FileName = current.MainModule!.FileName!,
+                    FileName = ExecutablePath,
                     Arguments = arguments,
                     WindowStyle = ProcessWindowStyle.Hidden,
                 };
 
                 try
                 {
-                    using Process elevated = Process.Start(startInfo)!;
+                    using var elevated = Process.Start(startInfo)!;
+
+                    if (stdinName is not null)
+                    {
+                        var stdin = new NamedPipeServerStream(stdinName, PipeDirection.Out, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+                        stdin.WaitForConnectionAsync().ContinueWith(_ => Console.OpenStandardInput().CopyToAsync(stdin));
+                    }
+
+                    if (stdoutName is not null)
+                    {
+                        var stdout = new NamedPipeServerStream(stdoutName, PipeDirection.In, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+                        stdout.WaitForConnectionAsync().ContinueWith(_ => stdout.CopyToAsync(Console.OpenStandardOutput()));
+                    }
+
+                    if (stderrName is not null)
+                    {
+                        var stderr = new NamedPipeServerStream(stderrName, PipeDirection.In, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+                        stderr.WaitForConnectionAsync().ContinueWith(_ => stderr.CopyToAsync(Console.OpenStandardError()));
+                    }
 
                     elevated.WaitForExit();
                     Environment.Exit(elevated.ExitCode);
@@ -1009,12 +1001,12 @@ namespace WinSW
                     return;
                 }
 
-                DateTime fileLastWriteTime = File.GetLastWriteTime(config.FullPath);
+                var fileLastWriteTime = File.GetLastWriteTime(config.FullPath);
 
-                using RegistryKey? registryKey = Registry.LocalMachine
-                    .OpenSubKey("SYSTEM")
-                    .OpenSubKey("CurrentControlSet")
-                    .OpenSubKey("Services")
+                using var registryKey = Registry.LocalMachine
+                    .OpenSubKey("SYSTEM")?
+                    .OpenSubKey("CurrentControlSet")?
+                    .OpenSubKey("Services")?
                     .OpenSubKey(config.Name);
 
                 if (registryKey is null)
@@ -1022,7 +1014,7 @@ namespace WinSW
                     return;
                 }
 
-                DateTime registryLastWriteTime = registryKey.GetLastWriteTime();
+                var registryLastWriteTime = registryKey.GetLastWriteTime();
 
                 if (fileLastWriteTime > registryLastWriteTime)
                 {
@@ -1032,16 +1024,16 @@ namespace WinSW
 
             static void DoRefresh(XmlServiceConfig config)
             {
-                using ServiceManager scm = ServiceManager.Open(ServiceManagerAccess.Connect);
+                using var scm = ServiceManager.Open(ServiceManagerAccess.Connect);
                 try
                 {
-                    using Service sc = scm.OpenService(config.Name);
+                    using var sc = scm.OpenService(config.Name);
 
                     sc.ChangeConfig(config.DisplayName, config.StartMode, config.ServiceDependencies);
 
                     sc.SetDescription(config.Description);
 
-                    SC_ACTION[] actions = config.FailureActions;
+                    var actions = config.FailureActions;
                     if (actions.Length > 0)
                     {
                         sc.SetFailureActions(config.ResetFailureAfter, actions);
@@ -1076,46 +1068,66 @@ namespace WinSW
         }
 
         /// <exception cref="FileNotFoundException" />
-        private static XmlServiceConfig LoadConfig(string? path)
+        private static XmlServiceConfig LoadConfigAndInitLoggers(string? path, bool inConsoleMode)
         {
             if (TestConfig != null)
             {
                 return TestConfig;
             }
 
-            if (path != null)
-            {
-                return new XmlServiceConfig(path);
-            }
-
-            path = Path.ChangeExtension(ExecutablePath, ".xml");
-            if (!File.Exists(path))
-            {
-                throw new FileNotFoundException("Unable to locate " + Path.GetFileNameWithoutExtension(path) + ".xml file within executable directory.");
-            }
-
-            return new XmlServiceConfig(path);
-        }
-
-        private static void InitLoggers(XmlServiceConfig config, bool enableConsoleLogging)
-        {
-            if (XmlServiceConfig.TestConfig != null)
-            {
-                return;
-            }
-
             // TODO: Make logging levels configurable
-            Level fileLogLevel = Level.Debug;
+            var fileLogLevel = Level.Debug;
+
             // TODO: Debug should not be printed to console by default. Otherwise commands like 'status' will be pollutted
             // This is a workaround till there is a better command line parsing, which will allow determining
-            Level consoleLogLevel = Level.Info;
-            Level eventLogLevel = Level.Warn;
+            var consoleLogLevel = Level.Info;
+            var eventLogLevel = Level.Warn;
 
-            List<IAppender> appenders = new List<IAppender>();
+            var repository = LogManager.GetRepository(Assembly.GetExecutingAssembly());
+
+            if (inConsoleMode)
+            {
+                var consoleAppender = new WinSWConsoleAppender
+                {
+                    Name = "Wrapper console log",
+                    Threshold = consoleLogLevel,
+                    Layout = new PatternLayout("%date{ABSOLUTE} - %message%newline"),
+                };
+                consoleAppender.ActivateOptions();
+
+                BasicConfigurator.Configure(repository, consoleAppender);
+            }
+            else
+            {
+                var eventLogAppender = new ServiceEventLogAppender(WrapperService.eventLogProvider)
+                {
+                    Name = "Wrapper event log",
+                    Threshold = eventLogLevel,
+                };
+                eventLogAppender.ActivateOptions();
+
+                BasicConfigurator.Configure(repository, eventLogAppender);
+            }
+
+            XmlServiceConfig config;
+            if (path != null)
+            {
+                config = new XmlServiceConfig(path);
+            }
+            else
+            {
+                path = Path.ChangeExtension(ExecutablePath, ".xml");
+                if (!File.Exists(path))
+                {
+                    throw new FileNotFoundException("Unable to locate " + Path.GetFileNameWithoutExtension(path) + ".xml file within executable directory.");
+                }
+
+                config = new XmlServiceConfig(path);
+            }
 
             // .wrapper.log
             string wrapperLogPath = Path.Combine(config.LogDirectory, config.BaseName + ".wrapper.log");
-            var wrapperLog = new FileAppender
+            var fileAppender = new FileAppender
             {
                 AppendToFile = true,
                 File = wrapperLogPath,
@@ -1125,55 +1137,30 @@ namespace WinSW
                 LockingModel = new FileAppender.MinimalLock(),
                 Layout = new PatternLayout("%date %-5level - %message%newline"),
             };
-            wrapperLog.ActivateOptions();
-            appenders.Add(wrapperLog);
+            fileAppender.ActivateOptions();
 
-            // console log
-            if (enableConsoleLogging)
-            {
-                var consoleAppender = new WinSWConsoleAppender
-                {
-                    Name = "Wrapper console log",
-                    Threshold = consoleLogLevel,
-                    Layout = new PatternLayout("%date{ABSOLUTE} - %message%newline"),
-                };
-                consoleAppender.ActivateOptions();
-                appenders.Add(consoleAppender);
-            }
+            BasicConfigurator.Configure(repository, fileAppender);
 
-            // event log
-            var systemEventLogger = new ServiceEventLogAppender(WrapperService.eventLogProvider)
-            {
-                Name = "Wrapper event log",
-                Threshold = eventLogLevel,
-            };
-            systemEventLogger.ActivateOptions();
-            appenders.Add(systemEventLogger);
-
-            BasicConfigurator.Configure(
-#if NETCOREAPP
-                LogManager.GetRepository(System.Reflection.Assembly.GetExecutingAssembly()),
-#endif
-                appenders.ToArray());
+            return config;
         }
 
         /// <exception cref="CommandException" />
         internal static bool IsProcessElevated()
         {
-            IntPtr process = ProcessApis.GetCurrentProcess();
-            if (!ProcessApis.OpenProcessToken(process, TokenAccessLevels.Read, out IntPtr token))
+            var process = ProcessApis.GetCurrentProcess();
+            if (!ProcessApis.OpenProcessToken(process, TokenAccessLevels.Read, out var token))
             {
                 Throw.Command.Win32Exception("Failed to open process token.");
             }
 
-            try
+            using (token)
             {
                 unsafe
                 {
                     if (!SecurityApis.GetTokenInformation(
                         token,
                         SecurityApis.TOKEN_INFORMATION_CLASS.TokenElevation,
-                        out SecurityApis.TOKEN_ELEVATION elevation,
+                        out var elevation,
                         sizeof(SecurityApis.TOKEN_ELEVATION),
                         out _))
                     {
@@ -1181,33 +1168,6 @@ namespace WinSW
                     }
 
                     return elevation.TokenIsElevated != 0;
-                }
-            }
-            finally
-            {
-                _ = HandleApis.CloseHandle(token);
-            }
-        }
-
-        private static string ReadPassword()
-        {
-            StringBuilder buf = new StringBuilder();
-            while (true)
-            {
-                ConsoleKeyInfo key = Console.ReadKey(true);
-                if (key.Key == ConsoleKey.Enter)
-                {
-                    return buf.ToString();
-                }
-                else if (key.Key == ConsoleKey.Backspace)
-                {
-                    _ = buf.Remove(buf.Length - 1, 1);
-                    Console.Write("\b \b");
-                }
-                else
-                {
-                    Console.Write('*');
-                    _ = buf.Append(key.KeyChar);
                 }
             }
         }

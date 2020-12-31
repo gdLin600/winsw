@@ -10,19 +10,31 @@ namespace WinSW.Logging
     /// </summary>
     internal sealed class ServiceEventLogAppender : AppenderSkeleton
     {
-        private readonly IServiceEventLogProvider provider;
+        private readonly WrapperServiceEventLogProvider provider;
 
-        internal ServiceEventLogAppender(IServiceEventLogProvider provider)
+        internal ServiceEventLogAppender(WrapperServiceEventLogProvider provider)
         {
             this.provider = provider;
         }
 
         protected override void Append(LoggingEvent loggingEvent)
         {
-            IServiceEventLog? eventLog = this.provider.Locate();
+            var eventLog = this.provider.Locate();
 
-            // We write the event iff the provider is ready
-            eventLog?.WriteEntry(loggingEvent.RenderedMessage, ToEventLogEntryType(loggingEvent.Level));
+            if (eventLog is not null)
+            {
+                eventLog.WriteEntry(loggingEvent.RenderedMessage, ToEventLogEntryType(loggingEvent.Level));
+                return;
+            }
+
+            try
+            {
+                using var backupLog = new EventLog("Application", ".", "Windows Service Wrapper");
+                backupLog.WriteEntry(loggingEvent.RenderedMessage, ToEventLogEntryType(loggingEvent.Level));
+            }
+            catch
+            {
+            }
         }
 
         private static EventLogEntryType ToEventLogEntryType(Level level)

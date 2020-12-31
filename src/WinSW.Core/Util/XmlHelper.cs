@@ -5,7 +5,7 @@ using System.Xml;
 
 namespace WinSW.Util
 {
-    public class XmlHelper
+    public static class XmlHelper
     {
         /// <summary>
         /// Retrieves a single string element
@@ -17,7 +17,7 @@ namespace WinSW.Util
         /// <exception cref="InvalidDataException">The required element is missing</exception>
         public static string? SingleElement(XmlNode node, string tagName, bool optional)
         {
-            XmlNode? n = node.SelectSingleNode(tagName);
+            var n = node.SelectSingleNode(tagName);
             if (n is null && !optional)
             {
                 throw new InvalidDataException("<" + tagName + "> is missing in configuration XML");
@@ -36,7 +36,7 @@ namespace WinSW.Util
         /// <exception cref="InvalidDataException">The required element is missing</exception>
         public static XmlNode? SingleNode(XmlNode node, string tagName, bool optional)
         {
-            XmlNode? n = node.SelectSingleNode(tagName);
+            var n = node.SelectSingleNode(tagName);
             if (n is null && !optional)
             {
                 throw new InvalidDataException("<" + tagName + "> is missing in configuration XML");
@@ -109,8 +109,7 @@ namespace WinSW.Util
             catch (ArgumentException ex)
             {
                 throw new InvalidDataException(
-                    "Cannot parse <" + attributeName + "> Enum value from string '" + substitutedValue +
-                    "'. Enum type: " + typeof(TAttributeType), ex);
+                    "Cannot parse <" + attributeName + "> Enum value from string '" + substitutedValue + "'. Enum type: " + typeof(TAttributeType), ex);
             }
         }
     }

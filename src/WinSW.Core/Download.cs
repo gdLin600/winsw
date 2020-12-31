@@ -106,7 +106,7 @@ namespace WinSW
         }
 
         // Source: http://stackoverflow.com/questions/2764577/forcing-basic-authentication-in-webrequest
-        private void SetBasicAuthHeader(WebRequest request, string username, string password)
+        private static void SetBasicAuthHeader(WebRequest request, string username, string password)
         {
             string authInfo = username + ":" + password;
             authInfo = Convert.ToBase64String(Encoding.GetEncoding("ISO-8859-1").GetBytes(authInfo));
@@ -121,10 +121,10 @@ namespace WinSW
         /// </exception>
         public async Task PerformAsync()
         {
-            WebRequest request = WebRequest.Create(this.From);
+            var request = WebRequest.Create(this.From);
             if (!string.IsNullOrEmpty(this.Proxy))
             {
-                CustomProxyInformation proxyInformation = new CustomProxyInformation(this.Proxy!);
+                var proxyInformation = new CustomProxyInformation(this.Proxy!);
                 if (proxyInformation.Credentials != null)
                 {
                     request.Proxy = new WebProxy(proxyInformation.ServerAddress, false, null, proxyInformation.Credentials);
@@ -148,7 +148,7 @@ namespace WinSW
                     break;
 
                 case AuthType.Basic:
-                    this.SetBasicAuthHeader(request, this.Username!, this.Password!);
+                    SetBasicAuthHeader(request, this.Username!, this.Password!);
                     break;
 
                 default:
@@ -166,16 +166,16 @@ namespace WinSW
             string tmpFilePath = this.To + ".tmp";
             try
             {
-                using (WebResponse response = await request.GetResponseAsync())
-                using (Stream responseStream = response.GetResponseStream())
-                using (FileStream tmpStream = new FileStream(tmpFilePath, FileMode.Create))
+                using (var response = await request.GetResponseAsync().ConfigureAwait(false))
+                using (var responseStream = response.GetResponseStream())
+                using (var tmpStream = new FileStream(tmpFilePath, FileMode.Create))
                 {
                     if (supportsIfModifiedSince)
                     {
                         lastModified = ((HttpWebResponse)response).LastModified;
                     }
 
-                    await responseStream.CopyToAsync(tmpStream);
+                    await responseStream.CopyToAsync(tmpStream).ConfigureAwait(false);
                 }
 
                 FileHelper.MoveOrReplaceFile(this.To + ".tmp", this.To);
